@@ -1,0 +1,216 @@
+---
+title: 'Introduction to: *Size asymmetry of resource competition and the structure
+  of plant communities*'
+author: "Andrew O'Reilly-Nugent"
+date: '2020-09-13'
+output:
+  html_document:
+    toc: yes
+    df_print: paged
+  html_notebook:
+    toc: yes
+subtitle: DeMalach, Zaady, Weiner, Kadmon (2016)
+---
+
+# Asymmetric competition
+
+The structure of plant communities changes along environmental gradients, possibly due to the availability of limiting resources. A common pattern is the shift from communities of many slow growing species coexisting at low fertility to uneven communities dominated by fast growing species at high fertility.
+
+One hypothesis is that light becomes a limiting resource for plant growth when soil nutrients are readily available. Fast growing species are able to intercept more light than slower species and have a disproportionate effect on the community by shading their competitors.
+
+DeMalach et al. propose a model of plant growth that includes competition for multiple resources. Although growth is only limited by one resource at any given point in time, resources are partitioned between plants in either symmetric or asymmetric manner:
+
+* Symmetric competition means that resources are partitioned proportionally to a plants size. A large plant with 2x the roots of a smaller plant will receive 2x the soil nutrients.
+* Asymmetric competition means that resources are partitioned disproportionately. A larger plant reduces the amount of light available for smaller plants by lowering the energetic quality or intensity of light for those below it (i.e. shading)
+
+Questions:
+
+* What is the expected effect of asymmetric competition?
+* What do we expect as competition transitions from symmetric to asymmetric? (e.g. switching from soil to light competition)
+
+
+# Growth function
+
+First load deSolve and tidyverse libraries:
+```{r}
+library(deSolve)
+library(tidyverse)
+```
+
+Now we describe a growth function that includes the partitioning of two resources between multiple indivudals. Frustratingly, I switched the parameter labels from $S$ in the paper (indicating species) to $B$ in my code (indicating biomass). All other equations should be nearly identical.
+
+Important parameters include:
+
+* $n$ the number of plants
+* $\mu$ growth rates
+* $c$ the cost of maintaining biomass
+* $\theta$ an 'asymmetry' parameter for each resource (symmetric $\theta = 1$)
+* $k$ the half saturation constant for resource uptake
+
+```{r}
+# deSolve function
+growth <- function(time,init,params) {
+  with (as.list(c(time,init,params)), {
+    
+    # Initialise model
+    n = length(init)
+    B = init
+    dB_dt <- vector(length = n)
+    
+    r <- vector(length = 2)
+    M <- vector(length = 2)
+    p <- vector(length = 2)
+    
+    # Coefficient of maintenance
+    c = 0.5
+    
+    # Eq 5a - Above ground maintenance (constant)
+    M[1] = c * mean(mu)
+    
+    for(i in 1:n){
+      # Eq. 5b - Below ground maintenance correlated with growth rate
+      M[2] = c * mu[i]
+      
+      for(j in 1:2) {
+        #  Eq. 4 - Division of resources by prop. biomass.
+        B_prop = B[i]^theta[j] / sum(B^theta[j])
+        
+        # Eq. 3 - Net resource availability
+        r[j] = R[j] * B_prop * B[i]^-1 - M[j]
+      }
+      
+      # Eq. 2 - Rate limiting resource
+      p = min(r / (k + r))
+      
+      # Eq. 1 - Growth (t + 1)
+      B_p1 = B[i] * mu[i] * p
+      
+      # Positive grwoth only
+      dB_dt[i] <- ifelse(B_p1 > 0, B_p1, 0)
+    }
+    
+    return(list(dB_dt))
+  })
+}
+
+```
+
+# Competition between plants
+
+We can take it for a spin, here estimating the growth of 20 plants over 100 timesteps. Growth rates $\mu$ are drawn randomly from a uniform distribution. Resource supply are constant, with more available light than soil nutrients, however the asymmetric for light $\theta_1 = 1.3$ is greater than for soil $\theta_2 = 1.0$. $k$ is fixed at 1 (I don't have a good intuition for this parameter)
+
+I can't remember why I used the `bdf` solver, but it should run in ~10sec. The results are converted to a dataframe, reshaped and annotate with our parameters (more relevant in the next section).
+
+```{r}
+# Test parameters
+n = 20
+t = 0:100
+mu = runif(n, 0.1, 2)
+theta = c(1.3, 1)
+R_light = 60
+R_soil = 30
+
+# Initial biomass of 0.5g, same for all plants
+init <- c(
+  B = rep(0.5, times = n)
+)
+
+# Package parameters
+params <- list(
+  mu = c(mu),  
+  k = 1,
+  theta = theta,
+  R = c(R_light, R_soil)
+)
+
+# Run model
+df <- ode(func=growth, y=init, parms=params, 
+        times=t, method = "bdf") %>%
+  as.data.frame() %>%
+  gather(plant_id, biomass, -1) %>%
+  mutate(time = time,
+         mu = rep(mu, each = length(t)),
+         R_light = R_light,
+         R_soil = R_soil)
+```
+
+We can see the biomass of each plant increasing from the starting point of 0.5g.
+
+```{r}
+head(df, 10)
+
+```
+
+The growth of several plants stalls early on. These are fast growing plants (by virtue of stalling first) that have reached their maximum size given the availability of soil nutrients and can no longer support the maintenance of additional biomass. 
+
+Three moderately growing plants are initially suppressed, but then surpass those with fast-starter advantage. These plants become the largest plants in the patch due to their lower maintenance costs.
+
+Lastly, several slower growing species continue to grow while the dominant plants are getting a foothold, but are inevitably overtaken by the larger plants and cannot intercept sufficient light to continue growing.
+
+```{r}
+ggplot(df, aes(x = time, y = biomass, colour = plant_id)) +
+  geom_line() +
+  theme_bw() 
+```
+
+* Oh, it turns out using random growth rates mean that your exact results may vary. Oops.*
+
+# Environmental gradients
+
+We can repeat this analysis several times to represent an environmental gradient. First, we load some additional libraries for parallel processing. The cluster `cl` consists of four workers that can complete tasks in tandem, rather than serially.
+
+```{r}
+library(foreach)
+library(doParallel)
+cl <- makeCluster(4)
+registerDoParallel(cl)
+```
+
+Our gradient consists of 12 patches, with soil resource values $R_{soil}$ ranging from 8 to 100. The foreach loop runs the same growth function for each patch, passing jobs to idle workers in the cluster, then uses `rbind()` to collate the results into one big dataframe.
+
+```{r}
+# Repeat simulation with 12 different soil values
+n_soil = 12
+R_soil <- round((100/n_soil) * 1:n_soil)
+
+sim <- foreach(i = iter(R_soil), 
+               .combine='rbind',
+               .packages=c('tidyverse', 'deSolve')) %dopar% 
+  {
+    # Package parameters
+    params <- list(
+      mu = c(mu),  
+      k = 1,
+      theta = theta,
+      R = c(R_light, i)
+    )
+    
+    ode(func=growth, y=init, parms=params, 
+          times=t, method = "bdf") %>%
+      as.data.frame() %>%
+      gather(plant_id, biomass, -1) %>%
+      mutate(time = time,
+             mu = rep(mu, each = length(t)),
+             R_light = R_light,
+             R_soil = i)
+   }
+```
+
+At low fertility (top left) we see the slowest growing plants reaching the greatest size over a long period. As soil resources increase, some faster growing plants begin to overtake and suppress their neighbours. At the highest fertility, the two fastest growing plants reach their maximum early, while all other competitors stall.
+
+Interestingly, there appears to be more biomass at intermediate fertility than either low or high fertility.
+
+```{r}
+ggplot(sim, aes(x = time, y = biomass, group = plant_id)) +
+  geom_line(aes(colour = mu)) +
+  facet_wrap(~ R_soil) +
+  theme_bw()
+
+```
+
+# Questions
+
+* Is this model parsimonious?
+* Are there any significant drawbacks to this approach?
+* How can this model be improved?
+* What would be the expected effect of environmental stochasticity?
